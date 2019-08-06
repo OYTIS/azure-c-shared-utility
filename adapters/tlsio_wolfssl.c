@@ -13,6 +13,7 @@
 #include "azure_c_shared_utility/gballoc.h"
 #include "azure_c_shared_utility/tlsio.h"
 #include "azure_c_shared_utility/tlsio_wolfssl.h"
+#include "azure_c_shared_utility/tlsio_cryptodev.h"
 #include "azure_c_shared_utility/socketio.h"
 #include "azure_c_shared_utility/crt_abstractions.h"
 #include "azure_c_shared_utility/optimize_size.h"
@@ -50,6 +51,7 @@ typedef struct TLS_IO_INSTANCE_TAG
     char* certificate;
     char* x509certificate;
     char* x509privatekey;
+    TLSIO_CRYPTODEV_PKEY* x509_cryptodev_private_key;
     int wolfssl_device_id;
 } TLS_IO_INSTANCE;
 
@@ -101,6 +103,16 @@ static void* tlsio_wolfssl_CloneOption(const char* name, const void* value)
             else
             {
                 /*return as is*/
+            }
+        }
+        else if (strcmp(name, SU_OPTION_X509_CRYPTODEV_PRIVATE_KEY) == 0)
+        {
+            result = malloc(sizeof(TLSIO_CRYPTODEV_PKEY));
+
+            if (result != NULL) {
+                memcpy(result, value, sizeof(TLSIO_CRYPTODEV_PKEY));
+            } else {
+                LogError("unable to allocate memory for TLSIO_CRYPTODEV_PKEY object");
             }
         }
         else
@@ -173,6 +185,16 @@ static OPTIONHANDLER_HANDLE tlsio_wolfssl_retrieveoptions(CONCRETE_IO_HANDLE tls
                 OptionHandler_Destroy(result);
                 result = NULL;
             }
+            else if (
+                (tls_io_instance->x509_cryptodev_private_key != NULL) &&
+                (OptionHandler_AddOption(result, SU_OPTION_X509_CRYPTODEV_PRIVATE_KEY, tls_io_instance->x509_cryptodev_private_key) != 0)
+                )
+            {
+                LogError("unable to save x509cryptodevprivatekey option");
+                OptionHandler_Destroy(result);
+                result = NULL;
+            }
+
             else if (
                 (tls_io_instance->certificate != NULL) &&
                 (OptionHandler_AddOption(result, OPTION_TRUSTED_CERT, tls_io_instance->certificate) != 0)
@@ -491,13 +513,65 @@ static int x509_wolfssl_add_credentials(WOLFSSL* ssl, char* x509certificate, cha
     {
         LogError("unable to enable secure renegotiation");
         result = MU_FAILURE;
-    }
+    _check}
 #endif
     else
     {
         result = 0;
     }
     return result;
+}
+
+static int wolfssl_cryptodev_sign(WOLFSSL* ssl, const byte* in, word32 inSz, byte* out, word32* outSz, const byte* key, word32 keySz, void* ctx) {
+  TLSIO_CRYPTODEV_PKEY* pkey = (TLSIO_CRYPTODEV_PKEY*) ctx;
+
+  if (pkey == NULL) {
+    LogError("no TLSIO_CRYPTODEV_PKEY specified for signing");
+    return -1;
+  }
+
+  int outSz_int;
+  if (pkey->sign(in, (int) inSz, out, &outSz_int, pkey->private_data) == 0) {
+    return -1;
+  }
+
+  *outSz = outSz_int;
+  return 0
+}
+
+static int wolfssl_cryptodev_sign_check(WOLFSSL* ssl, byte* sig, word32 sigSz, byte** out, const byte* key, word32 keySz, void* ctx) {
+    return 0;
+}
+
+static int x509_wolfssl_add_credentials_cryptodev(WOLFSSL* ssl, WOLFSSL_CTX* ssl_ctx, char* x509certificate, TLSIO_CRYPTODEV_PKEY* x509cryptodevpkey) {
+#ifdef HAVE_PK_CALLBACKS
+    int result;
+
+    if (wolfSSL_use_certificate_chain_buffer(ssl, (unsigned char*)x509certificate, strlen(x509certificate)) != SSL_SUCCESS)
+    {
+        LogError("unable to load x509 client certificate");
+        result = MU_FAILURE;
+    }
+#ifdef HAVE_SECURE_RENEGOTIATION
+    else if (wolfSSL_UseSecureRenegotiation(ssl) != SSL_SUCCESS)
+    {
+        LogError("unable to enable secure renegotiation");
+        result = MU_FAILURE;
+    }
+#endif
+    else
+    {
+	wolfSSL_CTX_SetRsaSignCb(ssl_ctx, wolfssl_cryptodev_sign);
+	wolfSSL_CTX_SetRsaSignCheckCb(ssl_ctx, wolfssl_cryptodev_sign_check);
+	wolfSSL_SetRsaSignCtx(ssl, x509cryptodevpkey)
+        result = 0;
+    }
+    return result;
+
+#else
+  LogError("private key callbacks disabled, can't use cryptodev private key");
+  result = MU_FAILURE;
+#endif
 }
 
 static void destroy_wolfssl_instance(TLS_IO_INSTANCE* tls_io_instance)
@@ -548,6 +622,14 @@ static int prepare_wolfssl_open(TLS_IO_INSTANCE* tls_io_instance)
     else if ((tls_io_instance->x509certificate != NULL) &&
         (tls_io_instance->x509privatekey != NULL) &&
         (x509_wolfssl_add_credentials(tls_io_instance->ssl, tls_io_instance->x509certificate, tls_io_instance->x509privatekey) != 0))
+    {
+        destroy_wolfssl_instance(tls_io_instance);
+        LogError("unable to use x509 authentication");
+        result = MU_FAILURE;
+    }
+    else if ((tls_io_instance->x509certificate != NULL) &&
+        (tls_io_instance->x509_cryptodev_private_key != NULL) &&
+        (x509_wolfssl_add_credentials_cryptodev(tls_io_instance->ssl, tls_io_instance->ssl_context, tls_io_instance->x509certificate, tls_io_instance->x509_cryptodev_private_key) != 0))
     {
         destroy_wolfssl_instance(tls_io_instance);
         LogError("unable to use x509 authentication");
@@ -691,6 +773,12 @@ void tlsio_wolfssl_destroy(CONCRETE_IO_HANDLE tls_io)
             free(tls_io_instance->x509privatekey);
             tls_io_instance->x509privatekey = NULL;
         }
+        if (tls_io_instance->x509_cryptodev_private_key != NULL)
+        {
+            free(tls_io_instance->x509_cryptodev_private_key);
+            tls_io_instance->x509_cryptodev_private_key = NULL;
+        }
+ 
         destroy_wolfssl_instance(tls_io_instance);
 
         wolfSSL_CTX_free(tls_io_instance->ssl_context);
@@ -907,6 +995,24 @@ int tlsio_wolfssl_setoption(CONCRETE_IO_HANDLE tls_io, const char* optionName, c
         {
             result = process_option(&tls_io_instance->x509privatekey, optionName, value);
         }
+        else if (strcmp(SU_OPTION_X509_CRYPTODEV_PRIVATE_KEY, optionName) == 0)
+        {
+	    if (tls_io_instance->x509_cryptodev_private_key != NULL)
+	    {
+                free(tls_io_instance->x509_cryptodev_private_key);
+                tls_io_instance->x509_cryptodev_private_key = NULL;
+	    }
+            tls_io_instance->x509_cryptodev_private_key = (TLSIO_CRYPTODEV_PKEY*) malloc(sizeof(TLSIO_CRYPTODEV_PKEY));
+	    if (tls_io_instance->x509_cryptodev_private_key == NULL)
+	    {
+                result = MU_FAILURE;
+	    }
+	    else
+	    {
+                memcpy(tls_io_instance->x509_cryptodev_private_key, value, sizeof(TLSIO_CRYPTODEV_PKEY));
+		result = 0;
+	    }
+	}
 #ifdef INVALID_DEVID
         else if (strcmp(OPTION_WOLFSSL_SET_DEVICE_ID, optionName) == 0)
         {
